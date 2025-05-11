@@ -1,0 +1,15 @@
+streamlit
+pandas
+matplotlib
+seaborn
+langchain
+langchain-openai
+openai
+ragas
+datasets
+elasticsearch
+langdetect
+
+# Ensure versions are pinned if you have specific compatibility needs, e.g.:
+# streamlit==1.30.0
+# pandas==2.0.3

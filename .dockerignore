@@ -1,0 +1,36 @@
+# Python virtual environment
+.venv/
+venv/
+ENV/
+env/
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+# IDE and editor directories
+.vscode/
+.idea/
+.project
+.classpath
+# OS-specific files
+.DS_Store
+Thumbs.db
+# Git directory
+.git/
+# Docker files themselves (if they are in the build context)
+Dockerfile
+.dockerignore
+# Output directories (if you don't want them in the image,
+# though some might be needed if they are part of the app's runtime data)
+rag_batch_outputs/
+ragas_eval_outputs/
+# Test files or directories (if any)
+tests/
+*.test.py
+# Local environment file (should be managed at runtime, not built into image)
+.env
+# Any other large files or build artifacts not needed for runtime
+*.log
+*.tmp
+*.swp
