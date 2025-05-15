@@ -3,6 +3,7 @@ import streamlit as st
 import os
 import sys
 import traceback
+import db_utils  # Uses Elasticsearch now
 
 # --- Add project root to sys.path ---
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -10,15 +11,15 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 # --- End of sys.path modification ---
 
-import retriever_utils as utils  # Should be retriever_utils_py_corrected
+import retriever_utils as utils
 import prompts
 from tabs import (
     ground_truth_tab,
     rag_processor_tab,
     ragas_eval_tab,
     viz_tab,
-    prompt_settings_tab
-    # experiments_dashboard_tab # Not included as per user's statement
+    prompt_settings_tab,
+    experiments_dashboard_tab  # Import new tab
 )
 
 RAGAS_AVAILABLE = False
@@ -26,37 +27,34 @@ try:
     from ragas import evaluate
     import langchain_openai
     import datasets
+    import altair  # Needed for charts in experiments dashboard
 
-    # import altair # Not needed if experiment dashboard is not yet implemented
     RAGAS_AVAILABLE = True
 except ImportError:
     RAGAS_AVAILABLE = False
+    # Suppress Altair import error if RAGAS itself is not available, as it's a sub-dependency for a RAGAS-related feature
+    if 'altair' not in sys.modules:  # Check if altair specifically failed
+        st.sidebar.warning(
+            "Altair library not found. Charts in Experiments Dashboard might be affected. Install with: pip install altair")
 
 st.set_page_config(layout="wide", page_title="Elkeval - RAG Testbed & Evaluator")
 
-
-# db_utils.init_db() # Not needed if experiment dashboard is not yet implemented
 
 @st.cache_resource
 def load_initial_config_and_clients():
     try:
         if not os.path.exists(".env"):
-            st.error("`.env` file not found. Please create it with your API keys and configurations.")
+            st.error("`.env` file not found.");
             return None, None, None, None, None, "`.env` file not found."
-
-        app_config = utils.load_config()  # from retriever_utils_py_corrected
+        app_config = utils.load_config()
         es_client, openai_client = utils.initialize_clients(app_config)
 
         azure_openai_model_name_from_config = app_config.get("AZURE_OPENAI_MODEL")
-        if not azure_openai_model_name_from_config:
-            st.warning("`AZURE_OPENAI_MODEL` not found in .env. Some features may be limited.")
-
-        # Corrected key to fetch ES_INDEX_NAME from .env if provided
+        if not azure_openai_model_name_from_config: st.warning("`AZURE_OPENAI_MODEL` not found in .env.")
         default_es_index = app_config.get("ES_INDEX_NAME_ENV", utils.INDEX_NAME)
-        if not default_es_index:  # Should not happen if utils.INDEX_NAME is defined
-            st.error("Default Elasticsearch index name could not be determined.")
-            # Potentially return an error or set a hardcoded failsafe
-            # For now, this will make default_es_index None if utils.INDEX_NAME is also None/empty
+
+        # Store app_config in session state for other modules to access (e.g., for ES HTTP calls)
+        st.session_state.app_config = app_config
 
         return es_client, openai_client, azure_openai_model_name_from_config, app_config, default_es_index, None
     except Exception as e:
@@ -66,7 +64,14 @@ def load_initial_config_and_clients():
 
 
 (es_client_instance, openai_client_instance, azure_openai_model_name,
- app_config, default_es_index, init_error) = load_initial_config_and_clients()
+ app_config_loaded, default_es_index,
+ init_error) = load_initial_config_and_clients()  # Renamed app_config to app_config_loaded
+
+# --- Initialize Database (Elasticsearch Index for Experiments) ---
+if es_client_instance and not init_error:
+    db_utils.init_db(es_client_instance)
+elif not es_client_instance and not init_error:
+    st.sidebar.error("Elasticsearch client not initialized. Experiment features will be unavailable.")
 
 # --- Initialize Prompts in Session State ---
 PROMPT_KEYS_FOR_APP_INIT = {
@@ -106,7 +111,7 @@ PAGES = {
     "🏠 Homepage": "Homepage", "📝 Ground Truth Generation": "Ground Truth Generation",
     "🔎 RAG Processor": "RAG Processor", "⚖️ RAGAS Evaluation": "RAGAS Evaluation",
     "📊 Evaluation Visualization": "Evaluation Visualization", "⚙️ Prompt Settings": "Prompt Settings",
-    # "🔬 Experiments Dashboard": "Experiments Dashboard" # Not included yet
+    "🔬 Experiments Dashboard": "Experiments Dashboard"
 }
 for display_name, page_key in PAGES.items():
     if st.sidebar.button(display_name, key=f"nav_{page_key}", use_container_width=True):
@@ -116,10 +121,11 @@ for display_name, page_key in PAGES.items():
             st.session_state.summary_data_for_explanation = None
 st.sidebar.divider();
 st.sidebar.header("⚙️ Global Status")
+
 if init_error:
     st.sidebar.error(f"Initialization Error: {init_error}")
-elif app_config is None:
-    st.sidebar.error("Failed to load .env config.")
+elif app_config_loaded is None:
+    st.sidebar.error("Failed to load .env config.")  # Use app_config_loaded
 else:
     st.sidebar.success("Configuration loaded.")
     if azure_openai_model_name:
@@ -129,7 +135,7 @@ else:
     if default_es_index:
         st.sidebar.info(f"Default ES Index: `{default_es_index}`")
     else:
-        st.sidebar.warning("Default ES Index not configured.")  # This might trigger if default_es_index is None
+        st.sidebar.warning("Default ES Index not configured.")
     if es_client_instance:
         st.sidebar.info("Elasticsearch client connected.")
     else:
@@ -153,37 +159,34 @@ if st.session_state.current_page == "Homepage":
     **Key Features:**
     * **📝 Ground Truth Generation** (with language detection & prompt translation)
     * **🔎 RAG Processor** (with multi-method selection & batch processing)
-    * **⚖️ RAGAS Evaluation**
+    * **⚖️ RAGAS Evaluation** (with option to save runs as experiments)
     * **📊 Evaluation Visualization** (with LLM-powered explanations)
     * **⚙️ Prompt Settings**: Customize LLM prompts.
-    """)  # Removed Experiments Dashboard from features for this version
+    * **🔬 Experiments Dashboard**: Track, compare, and manage your RAG experiments (using Elasticsearch!).
+    """)
 elif st.session_state.current_page == "Ground Truth Generation":
     if openai_client_instance and azure_openai_model_name:
         ground_truth_tab.show_ground_truth_tab(openai_client_instance, azure_openai_model_name)
     else:
         st.error("OpenAI client/model not available for Ground Truth Generation.")
 elif st.session_state.current_page == "RAG Processor":
-    if es_client_instance and openai_client_instance and azure_openai_model_name and default_es_index:  # This is the condition
+    if es_client_instance and openai_client_instance and azure_openai_model_name and default_es_index:
         rag_processor_tab.show_rag_processor_tab(es_client_instance, openai_client_instance, azure_openai_model_name,
                                                  default_es_index)
     else:
-        # Enhanced error message for debugging
-        error_details = []
-        if not es_client_instance: error_details.append("Elasticsearch client not initialized")
-        if not openai_client_instance: error_details.append("OpenAI client not initialized")
-        if not azure_openai_model_name: error_details.append("Azure OpenAI model name not configured")
-        if not default_es_index: error_details.append("Default Elasticsearch index not configured")
-        st.error(
-            f"Required clients or configurations not available for RAG Processor. Issues: {'; '.join(error_details)}. Please check your .env file and app logs.")
+        st.error("Required clients/configs not available for RAG Processor.")
 elif st.session_state.current_page == "RAGAS Evaluation":
-    if app_config:
-        # Assuming the RAGAS tab does not yet use es_client for experiment saving in this version
-        ragas_eval_tab.show_ragas_eval_tab(app_config, RAGAS_AVAILABLE_FLAG=RAGAS_AVAILABLE)
+    if app_config_loaded:
+        ragas_eval_tab.show_ragas_eval_tab(app_config_loaded, RAGAS_AVAILABLE_FLAG=RAGAS_AVAILABLE,
+                                           es_client=es_client_instance)  # Pass es_client
     else:
         st.error("App config not loaded for RAGAS evaluation.")
 elif st.session_state.current_page == "Evaluation Visualization":
     viz_tab.show_viz_tab(openai_client_instance, azure_openai_model_name)
 elif st.session_state.current_page == "Prompt Settings":
     prompt_settings_tab.show_prompt_settings_tab()
-# elif st.session_state.current_page == "Experiments Dashboard": # Not included yet
-# experiments_dashboard_tab.show_experiments_dashboard_tab(es_client=es_client_instance)
+elif st.session_state.current_page == "Experiments Dashboard":
+    if es_client_instance:
+        experiments_dashboard_tab.show_experiments_dashboard_tab(es_client=es_client_instance)
+    else:
+        st.error("Elasticsearch client not available. Cannot display Experiments Dashboard.")

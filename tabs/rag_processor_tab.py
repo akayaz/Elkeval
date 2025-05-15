@@ -7,47 +7,60 @@ import retriever_utils as utils
 import traceback
 
 # --- Configuration for retrieval methods ---
-# 'lexical_field_required': True if the method's lexical part uses field_to_query
-# 'semantic_field_required': True if the method's semantic part uses semantic_text_field
 METHOD_INFO = {
     'Full-Text Search': {'func': utils.query_fulltext, 'type': 'fulltext', 'lexical_field_required': True,
                          'semantic_field_required': False},
     'Semantic Search': {'func': utils.query_semantic, 'type': 'semantic', 'lexical_field_required': False,
                         'semantic_field_required': True},
     'Hybrid Search (RRF)': {'func': utils.query_hybrid, 'type': 'hybrid', 'lexical_field_required': True,
-                            'semantic_field_required': True},
+                            'semantic_field_required': True, 'uses_rrf': True},
     'Hybrid Search (Linear Combination)': {'func': utils.query_hybrid_linear, 'type': 'hybrid',
-                                           'lexical_field_required': True, 'semantic_field_required': True},
+                                           'lexical_field_required': True, 'semantic_field_required': True,
+                                           'uses_rrf': False},
     'BGE Semantic Search': {'func': utils.query_semantic_bge, 'type': 'semantic', 'lexical_field_required': False,
                             'semantic_field_required': True, 'vector_field_prefix': 'content_semantic_bge-m3'},
-    # vector_field_prefix is a hint for UI default
     'BGE Hybrid Search (RRF)': {'func': utils.query_hybrid_bge, 'type': 'hybrid', 'lexical_field_required': True,
-                                'semantic_field_required': True, 'vector_field_prefix': 'content_semantic_bge-m3'},
+                                'semantic_field_required': True, 'vector_field_prefix': 'content_semantic_bge-m3',
+                                'uses_rrf': True},
     'BGE Hybrid Search (Linear)': {'func': utils.query_hybrid_linear_bge, 'type': 'hybrid',
                                    'lexical_field_required': True, 'semantic_field_required': True,
-                                   'vector_field_prefix': 'content_semantic_bge-m3'},
+                                   'vector_field_prefix': 'content_semantic_bge-m3', 'uses_rrf': False},
     'Hybrid Rerank (Cohere)': {'func': utils.query_hybrid_rerank, 'type': 'hybrid_rerank',
-                               'lexical_field_required': True, 'semantic_field_required': True},
+                               'lexical_field_required': True, 'semantic_field_required': True, 'uses_rrf_base': True,
+                               'requires_reranker_id': True},
     'BGE Hybrid Rerank (Cohere)': {'func': utils.query_hybrid_bge_rerank, 'type': 'hybrid_rerank',
                                    'lexical_field_required': True, 'semantic_field_required': True,
-                                   'vector_field_prefix': 'content_semantic_bge-m3'}
+                                   'vector_field_prefix': 'content_semantic_bge-m3', 'uses_rrf_base': True,
+                                   'requires_reranker_id': True}
 }
 
 
 class QuestionProcessor:
     def __init__(self, es_client, openai_client, openai_model_name, method_name, index_name,
-                 field_to_query,
+                 lexical_field,
                  semantic_text_field,
-                 primary_content_field_for_llm, rerank_content_field=None):
+                 primary_content_field_for_llm,
+                 rrf_window_size, rrf_rank_constant,
+                 rerank_content_field=None,
+                 reranker_inference_id=None,
+                 base_rrf_window_size_for_rerank=50,
+                 base_rrf_rank_constant_for_rerank=60
+                 ):
         self.es_client = es_client
         self.openai_client = openai_client
         self.openai_model_name = openai_model_name
         self.method_name = method_name
         self.index_name = index_name
-        self.field_to_query = field_to_query
+        self.lexical_field = lexical_field
         self.semantic_text_field = semantic_text_field
         self.primary_content_field_for_llm = primary_content_field_for_llm
         self.rerank_content_field = rerank_content_field if rerank_content_field else primary_content_field_for_llm
+
+        self.rrf_window_size = rrf_window_size
+        self.rrf_rank_constant = rrf_rank_constant
+        self.reranker_inference_id = reranker_inference_id
+        self.base_rrf_window_size_for_rerank = base_rrf_window_size_for_rerank
+        self.base_rrf_rank_constant_for_rerank = base_rrf_rank_constant_for_rerank
 
         if self.method_name not in METHOD_INFO:
             raise ValueError(f"Unknown method '{self.method_name}' selected.")
@@ -55,6 +68,9 @@ class QuestionProcessor:
         self.method_type = METHOD_INFO[self.method_name]['type']
         self.lexical_field_required = METHOD_INFO[self.method_name]['lexical_field_required']
         self.semantic_field_required = METHOD_INFO[self.method_name]['semantic_field_required']
+        self.uses_rrf = METHOD_INFO[self.method_name].get('uses_rrf', False)
+        self.uses_rrf_base_for_rerank = METHOD_INFO[self.method_name].get('uses_rrf_base', False)
+        self.requires_reranker_id = METHOD_INFO[self.method_name].get('requires_reranker_id', False)
 
     def process_single_question(self, question_text):
         elasticsearch_results = []
@@ -62,11 +78,20 @@ class QuestionProcessor:
             query_args = {
                 "es_client": self.es_client, "query": question_text, "index_name": self.index_name
             }
-            if self.lexical_field_required: query_args["field_to_query"] = self.field_to_query
+            if self.lexical_field_required: query_args["field_to_query"] = self.lexical_field
             if self.semantic_field_required: query_args["semantic_text_field"] = self.semantic_text_field
+
+            if self.uses_rrf:
+                query_args["rank_window_size"] = self.rrf_window_size
+                query_args["rank_constant"] = self.rrf_rank_constant
+
             if self.method_type == 'hybrid_rerank':
                 query_args["rerank_content_field"] = self.rerank_content_field
-                query_args.setdefault("rank_window_size", 10);
+                query_args["inference_id"] = self.reranker_inference_id
+                if self.uses_rrf_base_for_rerank:
+                    query_args["base_rrf_window_size"] = self.base_rrf_window_size_for_rerank
+                    query_args["base_rrf_rank_constant"] = self.base_rrf_rank_constant_for_rerank
+                query_args.setdefault("rank_window_size", 10)
                 query_args.setdefault("min_score", 0.8)
 
             elasticsearch_results = self.query_function_ptr(**query_args)
@@ -91,11 +116,20 @@ class QuestionProcessor:
             query_args = {
                 "es_client": self.es_client, "query": question, "index_name": self.index_name
             }
-            if self.lexical_field_required: query_args["field_to_query"] = self.field_to_query
+            if self.lexical_field_required: query_args["field_to_query"] = self.lexical_field
             if self.semantic_field_required: query_args["semantic_text_field"] = self.semantic_text_field
+
+            if self.uses_rrf:
+                query_args["rank_window_size"] = self.rrf_window_size
+                query_args["rank_constant"] = self.rrf_rank_constant
+
             if self.method_type == 'hybrid_rerank':
                 query_args["rerank_content_field"] = self.rerank_content_field
-                query_args.setdefault("rank_window_size", 10);
+                query_args["inference_id"] = self.reranker_inference_id
+                if self.uses_rrf_base_for_rerank:
+                    query_args["base_rrf_window_size"] = self.base_rrf_window_size_for_rerank
+                    query_args["base_rrf_rank_constant"] = self.base_rrf_rank_constant_for_rerank
+                query_args.setdefault("rank_window_size", 10)
                 query_args.setdefault("min_score", 0.8)
 
             elasticsearch_results = self.query_function_ptr(**query_args)
@@ -115,18 +149,27 @@ class QuestionProcessor:
             if context_marker in prompt_for_model:
                 processed_retrieved_context_str = prompt_for_model.split(context_marker, 1)[-1].split("\n<|user|>")[
                     0].strip()
-        return {
+
+        output_dict = {
             "question": question, "context": question_data.get('context'),
             "ref_answer": question_data.get('answer'),
             "retrieved_context_for_llm": [processed_retrieved_context_str],
             "raw_retrieved_contexts_from_es": retrieved_context_list,
             "generated_answer": generated_answer, "retrieval_method": self.method_name,
             "index_name_used": self.index_name,
-            "lexical_field_queried": self.field_to_query,
+            "lexical_field_queried": self.lexical_field,
             "semantic_text_field_queried": self.semantic_text_field,
             "primary_llm_content_field": self.primary_content_field_for_llm,
             "model_used": self.openai_model_name
         }
+        if self.uses_rrf or self.uses_rrf_base_for_rerank:
+            output_dict[
+                "rrf_rank_window_size"] = self.rrf_window_size if self.uses_rrf else self.base_rrf_window_size_for_rerank
+            output_dict[
+                "rrf_rank_constant"] = self.rrf_rank_constant if self.uses_rrf else self.base_rrf_rank_constant_for_rerank
+        if self.requires_reranker_id:
+            output_dict["reranker_inference_id_used"] = self.reranker_inference_id
+        return output_dict
 
 
 def setup_output_file_st(input_file_name, output_file_path_st, method_st, default_folder="rag_batch_outputs",
@@ -147,104 +190,183 @@ def setup_output_file_st(input_file_name, output_file_path_st, method_st, defaul
 
 
 @st.cache_data(ttl=300)
-def get_cached_index_fields(_es_client, index_name, field_types):  # Changed es_client to _es_client
-    """Cached function to get index fields. _es_client is not hashed."""
-    if not _es_client or not index_name:  # Use _es_client internally
-        return []
-    mapping = utils.get_index_mapping(_es_client, index_name)  # Use _es_client internally
+def get_cached_index_fields(_es_client, index_name, field_types):
+    if not _es_client or not index_name: return []
+    mapping = utils.get_index_mapping(_es_client, index_name)
     if mapping and "properties" in mapping:
         return utils.extract_fields_from_mapping(mapping["properties"], field_types)
     return []
 
 
+@st.cache_data(ttl=300)
+def get_cached_reranker_ids(_es_client, app_config_for_http: dict):
+    if not _es_client and not app_config_for_http.get("ES_URL"):
+        return []
+    return utils.get_rerank_inference_ids(_es_client, app_config_for_http)
+
+
 def show_rag_processor_tab(es_client, openai_client, azure_openai_model_name, default_index_name):
     st.header("🔎 RAG Question Processing")
-    st.subheader("⚙️ RAG Processor Settings")
 
-    index_name_input_rag = st.text_input(
-        "Elasticsearch Index Name:",
-        value=st.session_state.get("rag_proc_index_name", default_index_name),
-        key="rag_index_input_tab",
-        on_change=lambda: st.session_state.update(rag_proc_index_name=st.session_state.rag_index_input_tab,
-                                                  rag_proc_fields_loaded=False)
-    )
-    st.session_state.rag_proc_index_name = index_name_input_rag
+    with st.container(border=True):
+        st.subheader("⚙️ RAG Processor Settings")
 
-    text_keyword_field_options = []
-    semantic_capable_field_options = []
+        index_name_input_rag = st.text_input(
+            "Elasticsearch Index Name:",
+            value=st.session_state.get("rag_proc_index_name", default_index_name),
+            key="rag_index_input_tab",
+            on_change=lambda: st.session_state.update(
+                rag_proc_index_name=st.session_state.rag_index_input_tab,
+                rag_proc_fields_loaded=False,
+                rag_proc_rerankers_loaded=False
+            )
+        )
+        st.session_state.rag_proc_index_name = index_name_input_rag
 
-    if 'rag_proc_fields_loaded' not in st.session_state:
-        st.session_state.rag_proc_fields_loaded = False
+        if 'rag_proc_fields_loaded' not in st.session_state:
+            st.session_state.rag_proc_fields_loaded = False
+        if 'rag_proc_rerankers_loaded' not in st.session_state:
+            st.session_state.rag_proc_rerankers_loaded = False
 
-    if es_client and index_name_input_rag and not st.session_state.rag_proc_fields_loaded:
-        with st.spinner(f"Fetching fields for index '{index_name_input_rag}'..."):
-            # Pass es_client to the cached function
-            text_keyword_field_options = get_cached_index_fields(es_client, index_name_input_rag, ["text"])
-            semantic_capable_field_options = get_cached_index_fields(es_client, index_name_input_rag,
-                                                                     ["semantic_text"])
+        app_config = st.session_state.get("app_config", {})
 
-            st.session_state.rag_proc_text_keyword_fields_options = text_keyword_field_options
-            st.session_state.rag_proc_semantic_capable_fields_options = semantic_capable_field_options
-            st.session_state.rag_proc_fields_loaded = True
+        needs_rerun_after_loading = False
+        if es_client and index_name_input_rag:
+            if not st.session_state.rag_proc_fields_loaded:
+                with st.spinner(f"Fetching fields for index '{index_name_input_rag}'..."):
+                    text_keyword_field_options = get_cached_index_fields(es_client, index_name_input_rag, ["text"])
+                    semantic_capable_field_options = get_cached_index_fields(es_client, index_name_input_rag,
+                                                                             ["semantic_text"])
+                    st.session_state.rag_proc_text_keyword_fields_options = text_keyword_field_options
+                    st.session_state.rag_proc_semantic_capable_fields_options = semantic_capable_field_options
+                    st.session_state.rag_proc_fields_loaded = True
+                    st.session_state.rag_selected_lexical_field = None
+                    st.session_state.rag_selected_semantic_text_field = None
+                    st.session_state.rag_selected_primary_content_field = None
+                    st.session_state.rag_selected_rerank_content_field = None
+                    needs_rerun_after_loading = True
 
-            st.session_state.rag_selected_lexical_field = None
-            st.session_state.rag_selected_semantic_text_field = None
-            st.session_state.rag_selected_primary_content_field = None
-            st.session_state.rag_selected_rerank_content_field = None
-            st.experimental_rerun()
+        if not st.session_state.rag_proc_rerankers_loaded:
+            if es_client or app_config.get("ES_URL"):
+                with st.spinner("Fetching reranker models..."):
+                    reranker_id_options = get_cached_reranker_ids(es_client, app_config)
+                    st.session_state.rag_proc_reranker_id_options = reranker_id_options
+                    st.session_state.rag_proc_rerankers_loaded = True
+                    # Set default for selectbox, but override will take precedence if user types
+                    st.session_state.rag_selectbox_reranker_id = reranker_id_options[0] if reranker_id_options else None
+                    st.session_state.rag_text_input_reranker_id = ""  # Initialize override field
+                    needs_rerun_after_loading = True
+            elif index_name_input_rag:
+                st.caption("ES client not available and ES_URL not in config; cannot fetch reranker models.")
 
-    text_keyword_field_options = st.session_state.get('rag_proc_text_keyword_fields_options', [])
-    semantic_capable_field_options = st.session_state.get('rag_proc_semantic_capable_fields_options', [])
+        if needs_rerun_after_loading:
+            st.rerun()
 
-    selected_lexical_field = st.selectbox(
-        "Lexical Search Field:",
-        options=[""] + text_keyword_field_options,
-        index=0 if not st.session_state.get('rag_selected_lexical_field') else (
-                    [""] + text_keyword_field_options).index(st.session_state.get('rag_selected_lexical_field')),
-        key="rag_lexical_field_select",
-        help="Select a 'text' or 'keyword' field for full-text search or the lexical part of hybrid queries."
-    )
-    st.session_state.rag_selected_lexical_field = selected_lexical_field if selected_lexical_field else None
+        text_keyword_field_options = st.session_state.get('rag_proc_text_keyword_fields_options', [])
+        semantic_capable_field_options = st.session_state.get('rag_proc_semantic_capable_fields_options', [])
+        reranker_id_options = st.session_state.get('rag_proc_reranker_id_options', [])
 
-    selected_semantic_text_field = st.selectbox(
-        "Semantic Search Field:",
-        options=[""] + semantic_capable_field_options,
-        index=0 if not st.session_state.get('rag_selected_semantic_text_field') else (
-                    [""] + semantic_capable_field_options).index(
-            st.session_state.get('rag_selected_semantic_text_field')),
-        key="rag_semantic_text_field_select",
-        help="Select a 'dense_vector' or 'text' field (for models like ELSER) for semantic search or the semantic part of hybrid queries."
-    )
-    st.session_state.rag_selected_semantic_text_field = selected_semantic_text_field if selected_semantic_text_field else None
+        col_lex, col_sem = st.columns(2)
+        with col_lex:
+            selected_lexical_field = st.selectbox(
+                "Lexical Search Field:", options=[""] + text_keyword_field_options,
+                index=0 if not st.session_state.get('rag_selected_lexical_field') else (
+                            [""] + text_keyword_field_options).index(
+                    st.session_state.get('rag_selected_lexical_field')),
+                key="rag_lexical_field_select", help="Field for full-text/lexical part of queries."
+            )
+            st.session_state.rag_selected_lexical_field = selected_lexical_field if selected_lexical_field else None
+        with col_sem:
+            selected_semantic_text_field = st.selectbox(
+                "Semantic Search Field:", options=[""] + semantic_capable_field_options,
+                index=0 if not st.session_state.get('rag_selected_semantic_text_field') else (
+                            [""] + semantic_capable_field_options).index(
+                    st.session_state.get('rag_selected_semantic_text_field')),
+                key="rag_semantic_text_field_select", help="Field for semantic/vector part of queries."
+            )
+            st.session_state.rag_selected_semantic_text_field = selected_semantic_text_field if selected_semantic_text_field else None
 
-    primary_content_field_options = text_keyword_field_options
-    selected_primary_content_field = st.selectbox(
-        "Primary Content Field for LLM Prompt:",
-        options=[""] + primary_content_field_options,
-        index=0 if not st.session_state.get('rag_selected_primary_content_field') else (
-                    [""] + primary_content_field_options).index(
-            st.session_state.get('rag_selected_primary_content_field')),
-        help="This field's content will be primarily used to construct the context for the LLM.",
-        key="rag_primary_content_field_select"
-    )
-    st.session_state.rag_selected_primary_content_field = selected_primary_content_field if selected_primary_content_field else None
+        selected_primary_content_field = st.selectbox(
+            "Primary Content Field for LLM Prompt:", options=[""] + text_keyword_field_options,
+            index=0 if not st.session_state.get('rag_selected_primary_content_field') else (
+                        [""] + text_keyword_field_options).index(
+                st.session_state.get('rag_selected_primary_content_field')),
+            key="rag_primary_content_field_select", help="Field content used to build LLM context."
+        )
+        st.session_state.rag_selected_primary_content_field = selected_primary_content_field if selected_primary_content_field else None
 
-    selected_rerank_content_field = st.selectbox(
-        "Content Field for Reranker Input (if using rerank method):",
-        options=[""] + text_keyword_field_options,
-        index=0 if not st.session_state.get('rag_selected_rerank_content_field') else (
-                    [""] + text_keyword_field_options).index(st.session_state.get('rag_selected_rerank_content_field')),
-        help="The content of this field will be sent to the reranker model.",
-        key="rag_rerank_content_field_select"
-    )
-    st.session_state.rag_selected_rerank_content_field = selected_rerank_content_field if selected_rerank_content_field else None
+        with st.expander("Reranker Settings (if using rerank methods)"):
+            selected_rerank_content_field = st.selectbox(
+                "Content Field for Reranker Input:", options=[""] + text_keyword_field_options,
+                index=0 if not st.session_state.get('rag_selected_rerank_content_field') else (
+                            [""] + text_keyword_field_options).index(
+                    st.session_state.get('rag_selected_rerank_content_field')),
+                key="rag_rerank_content_field_select", help="Field content sent to reranker model."
+            )
+            st.session_state.rag_selected_rerank_content_field = selected_rerank_content_field if selected_rerank_content_field else None
 
-    available_method_names = list(METHOD_INFO.keys())
-    selected_method_names_rag = st.multiselect(
-        "Select Retrieval Method(s):", options=available_method_names,
-        default=[available_method_names[0]] if available_method_names else [],
-        key="rag_methods_selector_tab"
-    )
+            if not reranker_id_options and (
+                    es_client or app_config.get("ES_URL")) and index_name_input_rag and st.session_state.get(
+                    'rag_proc_rerankers_loaded', False):
+                st.caption(
+                    "No 'rerank' type inference models found in Elasticsearch or an error occurred fetching them. You can manually enter an ID below.")
+
+            # Dropdown for discovered rerankers
+            selectbox_reranker_id = st.selectbox(
+                "Select Reranker Model (Inference ID):", options=[""] + reranker_id_options,
+                index=0 if not st.session_state.get('rag_selectbox_reranker_id') else (
+                            [""] + reranker_id_options).index(st.session_state.get('rag_selectbox_reranker_id')),
+                key="rag_selectbox_reranker_id_select",  # New key for selectbox
+                help="Select a discovered reranker or use the override field below."
+            )
+            st.session_state.rag_selectbox_reranker_id = selectbox_reranker_id if selectbox_reranker_id else None
+
+            # Text input for override
+            text_input_reranker_id = st.text_input(
+                "Override Reranker Inference ID (optional):",
+                value=st.session_state.get('rag_text_input_reranker_id', ""),
+                key="rag_text_input_reranker_id_override",
+                help="Manually enter an Inference ID. This will override the dropdown selection."
+            )
+            st.session_state.rag_text_input_reranker_id = text_input_reranker_id.strip()
+
+            # Determine the final reranker ID to use
+            final_selected_reranker_id = st.session_state.rag_text_input_reranker_id if st.session_state.rag_text_input_reranker_id else st.session_state.rag_selectbox_reranker_id
+            st.session_state.rag_selected_reranker_inference_id = final_selected_reranker_id  # This is what gets passed to QuestionProcessor
+
+        with st.expander("RRF Parameters (Advanced)"):
+            st.markdown("##### For RRF-based Hybrid Methods")
+            col_rrf1, col_rrf2 = st.columns(2)
+            with col_rrf1:
+                rrf_window_size_ui = st.number_input("RRF: Rank Window Size", min_value=1,
+                                                     value=st.session_state.get('rrf_window_size', 50), step=1,
+                                                     key="rrf_window_input")
+                st.session_state.rrf_window_size = rrf_window_size_ui
+            with col_rrf2:
+                rrf_rank_constant_ui = st.number_input("RRF: Rank Constant", min_value=1,
+                                                       value=st.session_state.get('rrf_rank_constant', 60), step=1,
+                                                       key="rrf_constant_input")
+                st.session_state.rrf_rank_constant = rrf_rank_constant_ui
+            st.markdown("##### For Reranker's Base Retriever (if it uses RRF)")
+            col_rrf_base1, col_rrf_base2 = st.columns(2)
+            with col_rrf_base1:
+                base_rrf_window_ui = st.number_input("Reranker Base RRF: Window Size", min_value=1,
+                                                     value=st.session_state.get('base_rrf_window_size_for_rerank', 50),
+                                                     step=1, key="base_rrf_window_rerank_input")
+                st.session_state.base_rrf_window_size_for_rerank = base_rrf_window_ui
+            with col_rrf_base2:
+                base_rrf_constant_ui = st.number_input("Reranker Base RRF: Rank Constant", min_value=1,
+                                                       value=st.session_state.get('base_rrf_rank_constant_for_rerank',
+                                                                                  60), step=1,
+                                                       key="base_rrf_constant_rerank_input")
+                st.session_state.base_rrf_rank_constant_for_rerank = base_rrf_constant_ui
+
+        available_method_names = list(METHOD_INFO.keys())
+        selected_method_names_rag = st.multiselect(
+            "Select Retrieval Method(s):", options=available_method_names,
+            default=[available_method_names[0]] if available_method_names else [],
+            key="rag_methods_selector_tab"
+        )
 
     st.divider();
     st.subheader("❓ Interactive Single Question")
@@ -257,22 +379,27 @@ def show_rag_processor_tab(es_client, openai_client, azure_openai_model_name, de
         if not selected_method_names_rag: st.warning("Please select retrieval method(s)."); valid_input = False
         if not selected_primary_content_field: st.warning(
             "Please select Primary Content Field for LLM."); valid_input = False
-
         for method_name in selected_method_names_rag:
             info = METHOD_INFO[method_name]
-            if info.get('lexical_field_required') and not selected_lexical_field:
+            if info.get('lexical_field_required') and not st.session_state.rag_selected_lexical_field:
                 st.warning(f"Method '{method_name}' requires a Lexical Search Field.");
                 valid_input = False;
                 break
-            if info.get('semantic_field_required') and not selected_semantic_text_field:
+            if info.get('semantic_field_required') and not st.session_state.rag_selected_semantic_text_field:
                 st.warning(f"Method '{method_name}' requires a Semantic Search Field.");
                 valid_input = False;
                 break
-            if info['type'] == 'hybrid_rerank' and not selected_rerank_content_field:
-                st.warning(f"Method '{method_name}' (rerank) requires Reranker Content Field.");
+            if info.get('requires_reranker_id',
+                        False) and not st.session_state.rag_selected_reranker_inference_id:  # Use the final determined ID
+                st.warning(f"Method '{method_name}' requires a Reranker Model (Inference ID).");
                 valid_input = False;
                 break
-
+            if info.get('requires_reranker_id',
+                        False) and st.session_state.rag_selected_reranker_inference_id and not st.session_state.rag_selected_rerank_content_field:
+                st.warning(
+                    f"Method '{method_name}' (rerank) requires Reranker Content Field when a Reranker Model is selected.");
+                valid_input = False;
+                break
         if not openai_client or not es_client: st.error("Clients not initialized."); valid_input = False
 
         if valid_input:
@@ -284,10 +411,16 @@ def show_rag_processor_tab(es_client, openai_client, azure_openai_model_name, de
                             processor = QuestionProcessor(
                                 es_client, openai_client, azure_openai_model_name,
                                 method_name_to_run, index_name_input_rag,
-                                field_to_query=selected_lexical_field,
-                                semantic_text_field=selected_semantic_text_field,
-                                primary_content_field_for_llm=selected_primary_content_field,
-                                rerank_content_field=selected_rerank_content_field
+                                lexical_field=st.session_state.rag_selected_lexical_field,
+                                semantic_text_field=st.session_state.rag_selected_semantic_text_field,
+                                primary_content_field_for_llm=st.session_state.rag_selected_primary_content_field,
+                                rrf_window_size=st.session_state.rrf_window_size,
+                                rrf_rank_constant=st.session_state.rrf_rank_constant,
+                                rerank_content_field=st.session_state.rag_selected_rerank_content_field,
+                                reranker_inference_id=st.session_state.rag_selected_reranker_inference_id,
+                                # Pass the final ID
+                                base_rrf_window_size_for_rerank=st.session_state.base_rrf_window_size_for_rerank,
+                                base_rrf_rank_constant_for_rerank=st.session_state.base_rrf_rank_constant_for_rerank
                             )
                             generated_answer, retrieved_context_str, es_results_json, num_es_results = processor.process_single_question(
                                 user_question)
@@ -324,16 +457,23 @@ def show_rag_processor_tab(es_client, openai_client, azure_openai_model_name, de
             "Please select Primary Content Field for LLM."); valid_input = False
         for method_name in selected_method_names_rag:
             info = METHOD_INFO[method_name]
-            if info.get('lexical_field_required') and not selected_lexical_field:
+            if info.get('lexical_field_required') and not st.session_state.rag_selected_lexical_field:
                 st.warning(f"Method '{method_name}' requires a Lexical Search Field.");
                 valid_input = False;
                 break
-            if info.get('semantic_field_required') and not selected_semantic_text_field:
+            if info.get('semantic_field_required') and not st.session_state.rag_selected_semantic_text_field:
                 st.warning(f"Method '{method_name}' requires a Semantic Search Field.");
                 valid_input = False;
                 break
-            if info['type'] == 'hybrid_rerank' and not selected_rerank_content_field:
-                st.warning(f"Method '{method_name}' (rerank) requires Reranker Content Field.");
+            if info.get('requires_reranker_id',
+                        False) and not st.session_state.rag_selected_reranker_inference_id:  # Use the final determined ID
+                st.warning(f"Method '{method_name}' requires a Reranker Model (Inference ID).");
+                valid_input = False;
+                break
+            if info.get('requires_reranker_id',
+                        False) and st.session_state.rag_selected_reranker_inference_id and not st.session_state.rag_selected_rerank_content_field:
+                st.warning(
+                    f"Method '{method_name}' (rerank) requires Reranker Content Field when a Reranker Model is selected.");
                 valid_input = False;
                 break
         if not openai_client or not es_client: st.error("Clients not initialized."); valid_input = False
@@ -360,10 +500,15 @@ def show_rag_processor_tab(es_client, openai_client, azure_openai_model_name, de
                     processor = QuestionProcessor(
                         es_client, openai_client, azure_openai_model_name,
                         method_name_to_run, index_name_input_rag,
-                        field_to_query=selected_lexical_field,
-                        semantic_text_field=selected_semantic_text_field,
-                        primary_content_field_for_llm=selected_primary_content_field,
-                        rerank_content_field=selected_rerank_content_field
+                        lexical_field=st.session_state.rag_selected_lexical_field,
+                        semantic_text_field=st.session_state.rag_selected_semantic_text_field,
+                        primary_content_field_for_llm=st.session_state.rag_selected_primary_content_field,
+                        rrf_window_size=st.session_state.rrf_window_size,
+                        rrf_rank_constant=st.session_state.rrf_rank_constant,
+                        rerank_content_field=st.session_state.rag_selected_rerank_content_field,
+                        reranker_inference_id=st.session_state.rag_selected_reranker_inference_id,  # Pass the final ID
+                        base_rrf_window_size_for_rerank=st.session_state.base_rrf_window_size_for_rerank,
+                        base_rrf_rank_constant_for_rerank=st.session_state.base_rrf_rank_constant_for_rerank
                     )
                 except ValueError as ve:
                     st.error(f"Config error for '{method_name_to_run}': {ve}. Skipping."); continue
