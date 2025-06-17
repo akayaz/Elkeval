@@ -20,6 +20,164 @@ DASHBOARD_METRICS_CONFIG = [
 ]
 
 
+def create_parallel_coordinates_chart(df_chart):
+    """Fixed Parallel Coordinates implementation"""
+    try:
+        # Data validation
+        if df_chart.empty:
+            st.error("❌ No data for parallel coordinates")
+            return None
+
+        required_cols = ['Experiment Name', 'Metric', 'Score']
+        if not all(col in df_chart.columns for col in required_cols):
+            st.error(f"❌ Missing columns: {required_cols}")
+            return None
+
+        # The key fix: proper data transformation
+        df_pivot = df_chart.pivot(index='Experiment Name', columns='Metric', values='Score').reset_index()
+        df_pivot['index'] = range(len(df_pivot))
+
+        # Define expected metrics (adjust to match your actual metrics)
+        expected_metrics = ['Faithfulness', 'Answer Relevancy', 'Context Precision', 'Context Recall']
+
+        # Check available metrics
+        available_metrics = [col for col in expected_metrics if col in df_pivot.columns]
+        if not available_metrics:
+            st.error("❌ No expected metrics found in data")
+            return None
+
+        st.info(f"✅ Creating parallel coordinates with {len(available_metrics)} metrics")
+
+        # Create the chart with proper transform_fold
+        chart = alt.Chart(df_pivot).transform_fold(
+            fold=available_metrics,
+            as_=['key', 'value']
+        ).mark_line(
+            point=True,
+            strokeWidth=2,
+            opacity=0.8
+        ).encode(
+            x=alt.X('key:N', title='RAGAS Metrics', axis=alt.Axis(labelAngle=-45)),
+            y=alt.Y('value:Q', title='Score', scale=alt.Scale(domain=[0, 1])),
+            color=alt.Color('Experiment Name:N', legend=alt.Legend(title="Experiments")),
+            detail='index:N',  # This is crucial for separate lines
+            tooltip=['Experiment Name:N', 'key:N', 'value:Q']
+        ).properties(
+            title='Performance Profiles - Parallel Coordinates',
+            width=500,
+            height=300
+        )
+
+        return chart
+
+    except Exception as e:
+        st.error(f"❌ Parallel coordinates error: {str(e)}")
+        return None
+
+
+def create_kpi_dashboard_chart(df_chart):
+    """Fixed KPI Dashboard implementation"""
+    try:
+        # Data validation
+        if df_chart.empty:
+            st.error("❌ No data for KPI dashboard")
+            return None
+
+        # Performance thresholds (customize these for your needs)
+        thresholds = {
+            'Faithfulness': {'poor': 0.6, 'good': 0.8, 'excellent': 1.0, 'target': 0.85},
+            'Answer Relevancy': {'poor': 0.6, 'good': 0.8, 'excellent': 1.0, 'target': 0.82},
+            'Context Precision': {'poor': 0.5, 'good': 0.7, 'excellent': 1.0, 'target': 0.75},
+            'Context Recall': {'poor': 0.5, 'good': 0.7, 'excellent': 1.0, 'target': 0.75}
+        }
+
+        # Build bullet chart data
+        bullet_data = []
+        available_metrics = df_chart['Metric'].unique()
+
+        for metric in available_metrics:
+            if metric not in thresholds:
+                continue
+
+            metric_data = df_chart[df_chart['Metric'] == metric]
+            config = thresholds[metric]
+
+            # Background ranges (from largest to smallest for proper layering)
+            bullet_data.extend([
+                {'metric': metric, 'type': 'range_3', 'value': config['excellent'], 'color': '#eee'},
+                {'metric': metric, 'type': 'range_2', 'value': config['good'], 'color': '#ddd'},
+                {'metric': metric, 'type': 'range_1', 'value': config['poor'], 'color': '#bbb'}
+            ])
+
+            # Actual values (performance bars)
+            for idx, (_, row) in enumerate(metric_data.iterrows()):
+                bullet_data.append({
+                    'metric': metric,
+                    'type': f'measure_{idx}',
+                    'value': row['Score'],
+                    'color': 'steelblue',
+                    'experiment': row['Experiment Name']
+                })
+
+            # Target line
+            bullet_data.append({
+                'metric': metric,
+                'type': 'target',
+                'value': config['target'],
+                'color': 'red'
+            })
+
+        if not bullet_data:
+            st.error("❌ Could not create bullet chart data")
+            return None
+
+        df_bullet = pd.DataFrame(bullet_data)
+        st.info(f"✅ Creating KPI dashboard with {len(available_metrics)} metrics")
+
+        # Create layered bullet chart
+        base = alt.Chart(df_bullet)
+
+        # Background ranges
+        ranges = base.transform_filter(
+            alt.expr.test(alt.expr.regexp('range'), alt.datum.type)
+        ).mark_bar(height=15).encode(
+            x=alt.X('value:Q', scale=alt.Scale(domain=[0, 1]), title='Score'),
+            y=alt.Y('metric:N', title='RAGAS Metrics'),
+            color=alt.Color('color:N', scale=None)
+        )
+
+        # Actual performance
+        measures = base.transform_filter(
+            alt.expr.test(alt.expr.regexp('measure'), alt.datum.type)
+        ).mark_bar(height=6).encode(
+            x='value:Q',
+            y='metric:N',
+            color=alt.value('steelblue'),
+            tooltip=['metric:N', 'experiment:N', 'value:Q']
+        )
+
+        # Target markers
+        targets = base.transform_filter(
+            alt.datum.type == 'target'
+        ).mark_tick(thickness=2, size=20, color='red').encode(
+            x='value:Q',
+            y='metric:N',
+            tooltip=['metric:N', alt.Tooltip('value:Q', title='Target')]
+        )
+
+        chart = (ranges + measures + targets).properties(
+            title='KPI Dashboard - Performance vs Targets',
+            width=600,
+            height=250
+        ).resolve_scale(color='independent')
+
+        return chart
+
+    except Exception as e:
+        st.error(f"❌ KPI dashboard error: {str(e)}")
+        return None
+
+
 def show_experiments_dashboard_tab(es_client):
     """Displays the Experiments Dashboard Tab with enhanced debugging."""
     st.header("🔬 Experiments Dashboard")
@@ -230,7 +388,21 @@ def show_experiments_dashboard_tab(es_client):
         st.divider()
         st.subheader("📊 Alternative Visualizations")
 
-        #create the visualization tabs
+        # create the visualization tabs
         show_alternative_visualizations(df_chart)
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.subheader("📊 Performance Profiles")
+            parallel_chart = create_parallel_coordinates_chart(df_chart)
+            if parallel_chart:
+                st.altair_chart(parallel_chart, use_container_width=True)
+
+        with col2:
+            st.subheader("🎯 KPI Dashboard")
+            kpi_chart = create_kpi_dashboard_chart(df_chart)
+            if kpi_chart:
+                st.altair_chart(kpi_chart, use_container_width=True)
     else:
         st.info("No experiments selected for comparison or selected experiments not found.")
