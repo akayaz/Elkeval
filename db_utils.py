@@ -28,7 +28,7 @@ def init_db(es_client: Elasticsearch):
                         "avg_faithfulness": {"type": "float"},
                         "avg_answer_relevancy": {"type": "float"},
                         "avg_llm_context_precision_with_reference": {"type": "float"},
-                        "avg_llm_context_recall": {"type": "float"},
+                        "avg_context_recall": {"type": "float"},
                         "retrieval_methods_used": {"type": "keyword"},
                         "notes": {"type": "text"}
                     }
@@ -83,7 +83,7 @@ def save_experiment(es_client: Elasticsearch, name: str, ragas_input_files: list
         "avg_faithfulness": metrics.get('faithfulness'),
         "avg_answer_relevancy": metrics.get('answer_relevancy'),
         "avg_llm_context_precision_with_reference": metrics.get('llm_context_precision_with_reference'),
-        "avg_llm_context_recall": metrics.get('llm_context_recall'),
+        "avg_context_recall": metrics.get('context_recall'),
         "retrieval_methods_used": list(set(retrieval_methods)),
         "notes": notes
     }

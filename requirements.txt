@@ -11,6 +11,7 @@ elasticsearch
 langdetect
 altair # For charts in experiments dashboard
 requests # For HTTP fallback in retriever_utils if needed (though client preferred)
+plotly # for alternative viz
 
 # Ensure versions are pinned if you have specific compatibility needs, e.g.:
 # streamlit==1.30.0
